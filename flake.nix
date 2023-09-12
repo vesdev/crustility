@@ -88,6 +88,7 @@
                 ];})
               ] ++ commonArgs.nativeBuildInputs;
 
+              LD_LIBRARY_PATH=pkgs.lib.makeLibraryPath (commonArgs.buildInputs);
             };
         };
     };
