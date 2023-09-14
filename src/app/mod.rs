@@ -1,5 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-
 use crate::device::{self, DeviceHandle, Devices};
 
 mod combobox;
@@ -14,7 +12,7 @@ pub fn run() -> Result<(), eframe::Error> {
     };
 
     let mut devices = Devices::default();
-    devices.rescan();
+    devices.scan();
 
     eframe::run_native(
         "Crustility",
@@ -54,6 +52,7 @@ impl Crustility {
 
 impl eframe::App for Crustility {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_data();
         ctx.set_pixels_per_point(1.5);
         ctx.set_visuals(self.theme.clone());
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -64,5 +63,33 @@ impl eframe::App for Crustility {
                 self.default_panel(ctx, ui);
             }
         });
+    }
+}
+
+impl Crustility {
+    fn handle_data(&mut self) {
+        if let Some(device) = self.device {
+            if let Some(device) = self.devices.get_mut(&device) {
+                let _ = device.spawn_event_loop(); //TODO handle this error
+                let Ok(data) = device.recv_data() else {
+                    return;
+                };
+
+                match data {
+                    device::Event::Init => {
+                        let _ = device.send_event(device::SendEvent::ReadSensorsBegin);
+                    }
+                    device::Event::Sensor(v) => {
+                        let Some(config) = device.config_mut() else {
+                            return;
+                        };
+                        config.hkeys[v.key].target_position = v.mapped
+                    }
+                    device::Event::Config(v) => {
+                        device.set_config(v);
+                    }
+                }
+            };
+        };
     }
 }

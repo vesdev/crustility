@@ -1,3 +1,4 @@
+use egui::load::Result;
 use indexmap::IndexMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -9,7 +10,7 @@ use crate::config::{self, Config, HKey, Millimeter};
 macro_rules! write_serial {
     ( $string:ident; $($key:literal, $idx:expr, $field:literal, $value:expr);+) => {
         $(
-            $string += &format!("{}{}.{} {}\n\r", $key, $idx, $field, &$value.to_string());
+            $string += &format!("{}{}.{} {}\n", $key, $idx, $field, &$value.to_string());
         )*
     };
 
@@ -21,6 +22,7 @@ struct Port {
     port: Option<Box<dyn serialport::SerialPort>>,
     port_name: String,
     unix_permission_requested: bool,
+    buffer: Vec<u8>,
 }
 
 impl Port {
@@ -29,16 +31,13 @@ impl Port {
             port: None,
             port_name,
             unix_permission_requested: false,
+            buffer: Vec::new(),
         }
     }
     /// Operate on a serial port
     ///
     /// Opens a new port if its not already open
-    fn open(
-        &mut self,
-        parity: serialport::Parity,
-        // callback: impl FnOnce(&mut Box<dyn serialport::SerialPort>) -> R,
-    ) -> Result<(), Error> {
+    fn open(&mut self, parity: serialport::Parity) -> Result<(), Error> {
         if self.port.is_none() {
             let port = Box::new(serialport::new(self.port_name.clone(), 115_200))
                 .timeout(Duration::from_millis(200))
@@ -80,12 +79,14 @@ impl Port {
 
     fn read(&mut self) -> Result<String, Error> {
         if let Some(port) = &mut self.port {
-            let mut result = String::new();
-
-            while let Some(Ok(chr)) = port.bytes().next() {
-                result.push(chr as char);
+            let mut serial_buf: Vec<u8> = vec![0; 1000];
+            loop {
+                match port.read(serial_buf.as_mut_slice()) {
+                    Ok(t) => return Ok(String::from_utf8(serial_buf[..t].to_vec()).unwrap()),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => (),
+                    Err(_) => break,
+                }
             }
-            return Ok(result);
         }
         Err(Error::Read)
     }
@@ -104,7 +105,8 @@ pub struct Device {
     key_count: u16,
     config: Option<Config>,
     is_dummy: bool,
-    pub receiver: Option<std::sync::mpsc::Receiver<SensorValue>>,
+    data_receiver: Option<std::sync::mpsc::Receiver<Event>>,
+    event_sender: Option<std::sync::mpsc::Sender<SendEvent>>,
 }
 
 impl Device {
@@ -122,16 +124,21 @@ impl Device {
     pub fn config_mut(&mut self) -> Option<&mut Config> {
         self.config.as_mut()
     }
+    pub fn set_config(&mut self, config: Config) {
+        self.config = Some(config);
+    }
 
-    pub fn write_config(&mut self) -> Result<(), Error> {
+    #[allow(unused)]
+    pub fn config(&mut self) -> Option<&Config> {
+        self.config.as_ref()
+    }
+
+    pub fn serialize_config(&mut self) -> Result<String, Error> {
         if self.is_dummy {
-            return Ok(());
+            return Err(Error::Parse);
         }
 
         if let Some(config) = &self.config {
-            let mut port = self.port.lock().map_err(|_| Error::Read)?;
-            port.open(serialport::Parity::Even)?;
-
             let mut commands = String::new();
 
             for (i, key) in config.hkeys.iter().enumerate() {
@@ -157,15 +164,12 @@ impl Device {
             }
 
             log::debug!("{}", commands);
-            port.write(commands)?;
+            return Ok(commands);
         }
-        Ok(())
+        Err(Error::Parse)
     }
 
-    pub fn load_config_from_serial(&mut self) -> Result<(), Error> {
-        if self.is_dummy {
-            return Ok(());
-        }
+    fn parse_config(raw_config: String) -> Result<Config, Error> {
         // the get ouput looks something like this
         // GET key=value
         // GET END
@@ -174,19 +178,14 @@ impl Device {
         // prefix -> (("h" | "d") "key" number) | string
         // suffix & value -> string
 
-        let mut port = self.port.lock().map_err(|_| Error::Read)?;
+        // let mut port = self.port.lock().map_err(|_| Error::Read)?;
 
-        port.open(serialport::Parity::Even)?;
-        port.write("get\n")?;
+        // port.open(serialport::Parity::Even)?;
+        // port.write("get\n")?;
 
         let mut config = Config::default();
 
-        for line in port.read()?.lines() {
-            if line == "GET END" {
-                self.config = Some(config);
-                return Ok(());
-            }
-
+        for line in raw_config.lines() {
             let Some(line) = line.strip_prefix("GET ") else {
                 continue;
             };
@@ -203,7 +202,6 @@ impl Device {
                         for _ in 0..key_count {
                             config.hkeys.push(HKey::default());
                         }
-                        self.key_count = key_count;
                     }
                     "dkeys" => {
                         //TODO
@@ -213,33 +211,82 @@ impl Device {
             }
         }
 
+        Ok(config)
+    }
+
+    fn read_sensors(port: &mut Port) -> Result<Vec<SensorData>, Error> {
+        port.write("out\n")?;
+        let mut result = Vec::new();
+        for line in port.read()?.lines() {
+            //sleep for per line or it will lag the device
+            std::thread::sleep(Duration::from_millis(20));
+
+            let Some(line) = line.strip_prefix("OUT ") else {
+                continue;
+            };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let Some((raw, mapped)) = value.split_once(' ') else {
+                continue;
+            };
+
+            let key_index = key[4..].parse::<usize>();
+            let raw = raw.parse::<usize>();
+            let mapped = mapped.parse::<usize>();
+            if let (Ok(key_index), Ok(raw), Ok(mapped)) = (key_index, raw, mapped) {
+                result.push(SensorData {
+                    raw,
+                    mapped: Millimeter::from_serial(mapped),
+                    key: key_index - 1,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn recv_data(&mut self) -> Result<Event, Error> {
+        let Some(data_receiver) = &mut self.data_receiver else {
+            return Err(Error::Read);
+        };
+        let Ok(data) = data_receiver.try_recv() else {
+            return Err(Error::Read);
+        };
+
+        Ok(data)
+    }
+
+    pub fn send_event(&mut self, event: SendEvent) -> Result<(), Error> {
+        let Some(event_sender) = &mut self.event_sender else {
+            return Err(Error::Send);
+        };
+        event_sender.send(event).map_err(|_| Error::Send)?;
         Ok(())
     }
 
-    pub fn read_sensors(&mut self) -> Result<(), Error> {
-        if self.receiver.is_some() {
+    pub fn spawn_event_loop(&mut self) -> Result<(), Error> {
+        if self.data_receiver.is_some() || self.event_sender.is_some() {
             return Ok(());
         }
-
-        let (sender, receiver) = std::sync::mpsc::channel::<SensorValue>();
-
-        self.receiver = Some(receiver);
+        let (data_sender, data_receiver) = std::sync::mpsc::channel::<Event>();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel::<SendEvent>();
+        self.data_receiver = Some(data_receiver);
+        self.event_sender = Some(event_sender);
 
         if self.is_dummy {
             if let Some(config) = self.config.as_ref() {
                 for (i, _) in config.hkeys.iter().enumerate() {
-                    sender
-                        .send(SensorValue {
+                    data_sender
+                        .send(Event::Sensor(SensorData {
                             raw: 500 * i,
                             mapped: Millimeter::from(2. * i as f32),
                             key: i,
-                        })
+                        }))
                         .map_err(|_| Error::Send)?;
                 }
                 return Ok(());
             }
         }
-
         {
             let port = self.port.clone();
 
@@ -247,45 +294,73 @@ impl Device {
             std::thread::spawn(move || {
                 let mut port = port.lock().map_err(|_| Error::Read)?;
 
-                port.open(serialport::Parity::None)?;
+                let mut read_sensors = false;
+                port.open(serialport::Parity::Even)?;
+                data_sender.send(Event::Init).map_err(|_| Error::Send)?;
 
                 loop {
-                    port.write("out\n")?;
-                    for line in port.read()?.lines() {
-                        log::debug!("{:?}", line);
-                        let Some(line) = line.strip_prefix("OUT ") else {
-                            continue;
-                        };
-                        let Some((key, value)) = line.split_once('=') else {
-                            continue;
-                        };
-                        let Some((raw, mapped)) = value.split_once(' ') else {
-                            continue;
-                        };
+                    if read_sensors {
+                        let sensor_data = Self::read_sensors(&mut port)?;
 
-                        let key_index = key[4..].parse::<usize>();
-                        let raw = raw.parse::<usize>();
-                        let mapped = mapped.parse::<usize>();
-                        if let (Ok(key_index), Ok(raw), Ok(mapped)) = (key_index, raw, mapped) {
-                            sender
-                                .send(SensorValue {
-                                    raw,
-                                    mapped: Millimeter::from_serial(mapped),
-                                    key: key_index - 1,
-                                })
-                                .map_err(|_| Error::Send)?;
+                        for data in sensor_data {
+                            let _ = data_sender
+                                .send(Event::Sensor(data))
+                                .map_err(|_| Error::Send);
+                        }
+                    }
+
+                    if let Ok(event) = event_receiver.try_recv() {
+                        match event {
+                            SendEvent::SendCommands(cmds) => {
+                                port.write(cmds).map_err(|_| Error::Send)?;
+                            }
+                            SendEvent::ReadSensorsBegin => read_sensors = true,
+                            SendEvent::ReadSensorsEnd => read_sensors = false,
+                            SendEvent::ReadConfig => {
+                                port.write("get\n")?;
+                                let mut raw_config = String::new();
+                                loop {
+                                    let line = port.read()?;
+                                    if line.contains("GET END") {
+                                        break;
+                                    }
+
+                                    log::debug!("{line}");
+                                    raw_config += &line;
+                                }
+                                let config = Self::parse_config(raw_config)?;
+                                data_sender
+                                    .send(Event::Config(config))
+                                    .map_err(|_| Error::Send)?;
+                            }
                         }
                     }
                 }
                 Ok::<(), Error>(())
             });
+            Ok(())
         }
-        Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SensorValue {
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendEvent {
+    /// send commands without a return value
+    SendCommands(String),
+    ReadSensorsBegin,
+    ReadSensorsEnd,
+    ReadConfig,
+}
+
+#[derive(Debug)]
+pub enum Event {
+    Init,
+    Sensor(SensorData),
+    Config(Config),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorData {
     pub raw: usize,
     pub mapped: Millimeter,
     pub key: usize,
@@ -367,7 +442,7 @@ impl Devices {
         self.device_map.get(handle)
     }
 
-    pub fn rescan(&mut self) {
+    pub fn scan(&mut self) {
         let ports = serialport::available_ports().expect("No ports found!");
         let mut old_devices = std::mem::take(&mut self.device_map);
 
@@ -392,7 +467,8 @@ impl Devices {
                                 config: None,
                                 key_count: 0,
                                 is_dummy: false,
-                                receiver: None,
+                                data_receiver: None,
+                                event_sender: None,
                             },
                         ))
                     }
@@ -414,7 +490,8 @@ impl Devices {
                     dkeys: Vec::new(),
                 }),
                 is_dummy: true,
-                receiver: None,
+                data_receiver: None,
+                event_sender: None,
             },
         );
     }
@@ -436,10 +513,6 @@ impl<'a> Iterator for DevicesIterator<'a> {
 pub enum Error {
     #[error(transparent)]
     Serial(#[from] serialport::Error),
-
-    #[error("error parsing minipad info")]
-    Parse(#[from] std::string::FromUtf8Error),
-
     #[error("serial port io")]
     Io(#[from] std::io::Error),
 
@@ -448,4 +521,7 @@ pub enum Error {
 
     #[error("could not send the value")]
     Send,
+
+    #[error("error parsing config")]
+    Parse,
 }

@@ -8,6 +8,7 @@ use egui::{pos2, vec2, Color32, RichText};
 use crate::{
     app::combobox,
     config::{HKey, Millimeter},
+    device,
 };
 
 use super::Crustility;
@@ -121,8 +122,10 @@ impl Crustility {
                 if ui.button("Apply Config").clicked() {
                     if let Some(device) = self.device {
                         if let Some(device) = self.devices.get_mut(&device) {
-                            let err = device.write_config();
-                            self.consume_error(err);
+                            if let Ok(raw_config) = device.serialize_config() {
+                                let _ =
+                                    device.send_event(device::SendEvent::SendCommands(raw_config));
+                            }
                         }
                     }
                 };
@@ -191,7 +194,7 @@ impl Crustility {
                 .show_ui(ui, |ui| {
                     //refresh devices when combo box is opened
                     if REFRESH.swap(false, Ordering::SeqCst) {
-                        self.devices.rescan();
+                        self.devices.scan();
                     }
                     let devices = &self.devices;
                     ui.vertical_centered_justified(|ui| {
@@ -215,7 +218,7 @@ impl Crustility {
                     let mut result = Ok(());
                     if let Some(d) = self.device {
                         if let Some(d) = self.devices.get_mut(&d) {
-                            result = d.load_config_from_serial();
+                            result = d.send_event(device::SendEvent::ReadConfig);
                         }
                     }
 
@@ -234,21 +237,15 @@ impl Crustility {
         let Some(device) = self.devices.get_mut(&device) else {
             return;
         };
-        let _ = device.read_sensors();
-        let receiver = device.receiver.as_ref();
-
-        if let Some(receiver) = receiver {
-            if let Ok(value) = receiver.try_recv() {
-                device.config_mut().unwrap().hkeys[value.key].target_position = value.mapped;
-            };
-        }
-
+        let Some(config) = device.config_mut() else {
+            return;
+        };
         // 60 fps target
         ctx.request_repaint_after(Duration::from_millis(10));
 
         let mut draw_visualizer = |ui: &mut egui::Ui, (i, key): (usize, &mut HKey)| {
             key.current_position = key.current_position
-                + (key.target_position - key.current_position) / Millimeter::from(5.);
+                + (key.target_position - key.current_position) / Millimeter::from(2.);
 
             let key_rect = egui::Rect::from_two_pos(
                 egui::pos2(
@@ -322,9 +319,7 @@ impl Crustility {
         };
 
         ui.horizontal(|ui| {
-            device
-                .config_mut()
-                .unwrap()
+            config
                 .hkeys
                 .iter_mut()
                 .enumerate()

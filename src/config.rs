@@ -2,13 +2,13 @@ use std::ops::{Add, Div, Mul, Sub};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub hkeys: Vec<HKey>,
     pub dkeys: Vec<DKey>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct HKey {
     pub rt: Option<RapidTrigger>,
     pub hysterisis: Hysterisis,
@@ -20,20 +20,20 @@ pub struct HKey {
     pub target_position: Millimeter,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RapidTrigger {
     pub continuos: bool, //continuos rapid trigger
     pub down_sensitivity: Millimeter,
     pub up_sensitivity: Millimeter,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Hysterisis {
     pub lower: Millimeter,
     pub upper: Millimeter,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Millimeter(f32);
 
 impl From<f32> for Millimeter {
