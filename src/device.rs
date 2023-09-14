@@ -1,51 +1,65 @@
 use indexmap::IndexMap;
-use std::fmt::Write;
 use std::io::Read;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 use thiserror::Error;
 
-use crate::config::{self, Config, DKey, HKey, Millimeter};
+use crate::config::{self, Config, HKey, Millimeter};
 
+macro_rules! write_serial {
+    ( $string:ident; $($key:literal, $idx:expr, $field:literal, $value:expr);+) => {
+        $(
+            $string += &format!("{}{}.{} {}\n\r", $key, $idx, $field, &$value.to_string());
+        )*
+    };
+
+}
+
+/// Serial Port
 #[derive(Debug)]
 struct Port {
     port: Option<Box<dyn serialport::SerialPort>>,
     port_name: String,
+    unix_permission_requested: bool,
 }
 
 impl Port {
-    /// operate on a serial port
-    /// opens a new port if its not already open
-    fn open<R>(
+    fn new(port_name: String) -> Self {
+        Self {
+            port: None,
+            port_name,
+            unix_permission_requested: false,
+        }
+    }
+    /// Operate on a serial port
+    ///
+    /// Opens a new port if its not already open
+    fn open(
         &mut self,
-        operations: impl FnOnce(&mut Box<dyn serialport::SerialPort>) -> R,
-    ) -> Result<R, Error> {
+        parity: serialport::Parity,
+        // callback: impl FnOnce(&mut Box<dyn serialport::SerialPort>) -> R,
+    ) -> Result<(), Error> {
         if self.port.is_none() {
-            println!(
-                "{}",
-                "pkexec chmod 644 ".to_string() + self.port_name.as_str()
-            );
-
-            let connect_port = || {
-                Box::new(serialport::new(self.port_name.clone(), 115_200))
-                    .timeout(Duration::from_millis(200))
-                    .flow_control(serialport::FlowControl::Hardware)
-                    .parity(serialport::Parity::Even)
-                    .stop_bits(serialport::StopBits::One)
-                    .open()
-            };
-
-            let port = connect_port();
+            let port = Box::new(serialport::new(self.port_name.clone(), 115_200))
+                .timeout(Duration::from_millis(200))
+                .flow_control(serialport::FlowControl::Hardware)
+                .parity(parity)
+                .data_bits(serialport::DataBits::Eight)
+                .stop_bits(serialport::StopBits::One)
+                .open();
 
             match port {
                 Err(serialport::Error {
                     kind: serialport::ErrorKind::Io(e),
                     description: _,
                 }) if e == std::io::ErrorKind::PermissionDenied && cfg!(unix) => {
-                    let _ = std::process::Command::new("pkexec")
-                        .arg("chmod")
-                        .arg("666")
-                        .arg(self.port_name.as_str())
-                        .spawn();
+                    if self.unix_permission_requested {
+                        let _ = std::process::Command::new("pkexec")
+                            .arg("chmod")
+                            .arg("666")
+                            .arg(self.port_name.as_str())
+                            .spawn();
+                        self.unix_permission_requested = true;
+                    }
                 }
                 _ => (),
             }
@@ -53,22 +67,43 @@ impl Port {
             self.port = Some(port?);
         }
 
+        Ok(())
         // port is guaranteed to be some
-        Ok(operations(unsafe { self.port.as_mut().unwrap_unchecked() }))
+        // Ok(callback(unsafe { self.port.as_mut().unwrap_unchecked() }))
     }
 
+    fn write(&mut self, data: impl Into<String>) -> Result<(), Error> {
+        if let Some(port) = &mut self.port {
+            port.write_all(data.into().as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn read(&mut self) -> Result<String, Error> {
+        if let Some(port) = &mut self.port {
+            let mut result = String::new();
+
+            while let Some(Ok(chr)) = port.bytes().next() {
+                result.push(chr as char);
+            }
+            return Ok(result);
+        }
+        Err(Error::Read)
+    }
+
+    #[allow(unused)]
     fn close(&mut self) {
         self.port = None;
     }
 }
 
+/// Device using the minipad serial protocol
 #[derive(Debug)]
 pub struct Device {
     port: Port,
     name: String,
     key_count: u16,
     config: Option<Config>,
-    config_modified: bool,
     is_dummy: bool,
 }
 
@@ -76,9 +111,11 @@ impl Device {
     pub fn name(&self) -> &String {
         &self.name
     }
+    #[allow(unused)]
     pub fn key_count(&self) -> u16 {
         self.key_count
     }
+    #[allow(unused)]
     pub fn port_name(&self) -> &String {
         &self.port.port_name
     }
@@ -92,32 +129,34 @@ impl Device {
         }
 
         if let Some(config) = &self.config {
-            self.port.open(|port| {
-                let mut commands = String::new();
+            self.port.open(serialport::Parity::Even)?;
 
-                for (i, key) in config.hkeys.iter().enumerate() {
-                    let i = i + 1;
-                    if let Some(rt) = &key.rt {
-                        writeln!(commands, "hkey{i}.rt 1").unwrap();
-                        writeln!(commands, "hkey{i}.crt {}", rt.continuos).unwrap();
-                        writeln!(commands, "hkey{i}.rtus {}", rt.up_sensitivity.to_serial())
-                            .unwrap();
-                        writeln!(commands, "hkey{i}.rtds {}", rt.down_sensitivity.to_serial())
-                            .unwrap();
-                        writeln!(commands, "hkey{i}.lh {}", key.hysterisis.lower.to_serial())
-                            .unwrap();
-                        writeln!(commands, "hkey{i}.uh {}", key.hysterisis.upper.to_serial())
-                            .unwrap();
-                        writeln!(commands, "hkey{i}.char {}", key.char.as_bytes()[0]).unwrap();
-                        writeln!(commands, "hkey{i}.hid {}", key.hid).unwrap();
-                    } else {
-                        writeln!(commands, "hkey{i}.rt 0").unwrap();
-                    }
+            let mut commands = String::new();
+
+            for (i, key) in config.hkeys.iter().enumerate() {
+                let idx = i + 1;
+                if let Some(rt) = &key.rt {
+                    write_serial!(
+                        commands;
+                        "hkey", idx, "rt",   1;
+                        "hkey", idx, "crt",  rt.continuos;
+                        "hkey", idx, "rtus", rt.up_sensitivity.to_serial();
+                        "hkey", idx, "rtds", rt.down_sensitivity.to_serial();
+                        "hkey", idx, "lh",   key.hysterisis.lower.to_serial();
+                        "hkey", idx, "rtuh", key.hysterisis.upper.to_serial();
+                        "hkey", idx, "char", key.char.as_bytes()[0];
+                        "hkey", idx, "hid",  key.hid
+                    );
+                } else {
+                    write_serial!(
+                        commands;
+                        "hkey", idx, "rt", 0
+                    );
                 }
+            }
 
-                port.write_all(commands.as_bytes()).expect("write failed");
-                log::debug!("{}", commands);
-            })?;
+            log::debug!("{}", commands);
+            self.port.write(commands)?;
         }
         Ok(())
     }
@@ -134,53 +173,100 @@ impl Device {
         // prefix -> (("h" | "d") "key" number) | string
         // suffix & value -> string
 
-        self.port.open(|port| {
-            port.write_all("get\n".as_bytes()).expect("write failed");
+        self.port.open(serialport::Parity::Even)?;
+        self.port.write("get\n")?;
 
-            let mut config = Config::default();
+        let mut config = Config::default();
 
-            let mut line = String::new();
-            let mut bytes = port.bytes();
-            while let Some(Ok(chr)) = bytes.next() {
-                let chr = chr as char;
-                if matches!(chr, '\n' | '\r') {
-                    log::debug!("{line}");
-                    if line == "GET END" {
-                        self.config = Some(config);
-                        return Ok(());
-                    }
+        for line in self.port.read()?.lines() {
+            if line == "GET END" {
+                self.config = Some(config);
+                return Ok(());
+            }
 
-                    if let Some(line) = line.strip_prefix("GET ") {
-                        if let Some((key, value)) = line.split_once('=') {
-                            if let Some((lhs, rhs)) = key.split_once('.') {
-                                map_key_to_config(&mut config, lhs, rhs, value);
-                            } else {
-                                match key {
-                                    "hkeys" => {
-                                        let key_count = value.parse::<u16>().unwrap();
-                                        for _ in 0..key_count {
-                                            config.hkeys.push(HKey::default());
-                                        }
-                                        self.key_count = key_count;
-                                    }
-                                    "dkeys" => {
-                                        //TODO
-                                    }
-                                    _ => {}
-                                }
-                            }
+            let Some(line) = line.strip_prefix("GET ") else {
+                continue;
+            };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+
+            if let Some((lhs, rhs)) = key.split_once('.') {
+                map_key_to_config(&mut config, lhs, rhs, value);
+            } else {
+                match key {
+                    "hkeys" => {
+                        let key_count = value.parse::<u16>().unwrap();
+                        for _ in 0..key_count {
+                            config.hkeys.push(HKey::default());
                         }
+                        self.key_count = key_count;
                     }
+                    "dkeys" => {
+                        //TODO
+                    }
+                    _ => (),
+                };
+            }
+        }
 
-                    line.clear();
-                } else {
-                    line.push(chr);
+        Ok(())
+    }
+
+    pub fn read_sensors(&mut self) -> Result<Vec<Option<SensorValue>>, Error> {
+        if self.is_dummy {
+            if let Some(config) = &mut self.config {
+                let mut result = vec![None; config.hkeys.len()];
+                for (i, _) in config.hkeys.iter().enumerate() {
+                    result[i] = Some(SensorValue {
+                        raw: 500 * i,
+                        mapped: Millimeter::from(2. * i as f32),
+                        key: i,
+                    });
+                }
+                return Ok(result);
+            }
+        }
+
+        self.port.open(serialport::Parity::None)?;
+        if let Some(config) = &mut self.config {
+            self.port.write("out\n")?;
+            let mut result = vec![None; config.hkeys.len()];
+            for line in self.port.read()?.lines() {
+                // log::debug!("{:?}", line);
+                let Some(line) = line.strip_prefix("OUT ") else {
+                    return Err(Error::Read);
+                };
+                let Some((key, value)) = line.split_once('=') else {
+                    return Err(Error::Read);
+                };
+                let Some((raw, mapped)) = value.split_once(' ') else {
+                    return Err(Error::Read);
+                };
+
+                let key_index = key[4..].parse::<usize>();
+                let raw = raw.parse::<usize>();
+                let mapped = mapped.parse::<usize>();
+                if let (Ok(key_index), Ok(raw), Ok(mapped)) = (key_index, raw, mapped) {
+                    result[key_index - 1] = Some(SensorValue {
+                        raw,
+                        mapped: Millimeter::from_serial(mapped),
+                        key: key_index - 1,
+                    });
                 }
             }
-            println!("{:?}", self.name);
+            Ok(result)
+        } else {
             Err(Error::Read)
-        })?
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SensorValue {
+    pub raw: usize,
+    pub mapped: Millimeter,
+    pub key: usize,
 }
 
 fn map_key_to_config(config: &mut Config, key_prefix: &str, key_suffix: &str, value: &str) {
@@ -202,21 +288,21 @@ fn map_key_to_config(config: &mut Config, key_prefix: &str, key_suffix: &str, va
             }
             "rtus" => {
                 if let Some(rt) = &mut config.hkeys[key_index].rt {
-                    rt.up_sensitivity = Millimeter::from_serial(value.parse::<u16>().unwrap())
+                    rt.up_sensitivity = Millimeter::from_serial(value.parse::<usize>().unwrap())
                 };
             }
             "rtds" => {
                 if let Some(rt) = &mut config.hkeys[key_index].rt {
-                    rt.down_sensitivity = Millimeter::from_serial(value.parse::<u16>().unwrap())
+                    rt.down_sensitivity = Millimeter::from_serial(value.parse::<usize>().unwrap())
                 };
             }
             "uh" => {
                 config.hkeys[key_index].hysterisis.upper =
-                    Millimeter::from_serial(value.parse::<u16>().unwrap())
+                    Millimeter::from_serial(value.parse::<usize>().unwrap())
             }
             "lh" => {
                 config.hkeys[key_index].hysterisis.lower =
-                    Millimeter::from_serial(value.parse::<u16>().unwrap())
+                    Millimeter::from_serial(value.parse::<usize>().unwrap())
             }
             "char" => {
                 config.hkeys[key_index].char = (value.parse::<u8>().unwrap() as char).to_string()
@@ -259,7 +345,7 @@ impl Devices {
         self.device_map.get(handle)
     }
 
-    pub fn refresh(&mut self) {
+    pub fn rescan(&mut self) {
         let ports = serialport::available_ports().expect("No ports found!");
         let mut old_devices = std::mem::take(&mut self.device_map);
 
@@ -273,23 +359,15 @@ impl Devices {
                     };
 
                     if let Some(mut device) = old_devices.remove(&handle) {
-                        device.port = Port {
-                            // invalidate current port since it might have changed
-                            port: None,
-                            port_name: p.port_name.clone(),
-                        };
+                        device.port = Port::new(p.port_name.clone());
                         Some((handle, device))
                     } else {
                         Some((
                             handle,
                             Device {
-                                port: Port {
-                                    port: None,
-                                    port_name: p.port_name.clone(),
-                                },
+                                port: Port::new(p.port_name.clone()),
                                 name: info.product.as_ref().map_or("", String::as_str).to_string(),
                                 config: None,
-                                config_modified: false,
                                 key_count: 0,
                                 is_dummy: false,
                             },
@@ -301,26 +379,21 @@ impl Devices {
             })
             .collect();
 
+        #[cfg(debug_assertions)]
         self.device_map.insert(
             DeviceHandle { pid: 0, vid: 0 },
             Device {
-                port: Port {
-                    port: None,
-                    port_name: "/dev/null".to_string(),
-                },
+                port: Port::new("/dev/null".to_string()),
                 name: "<dummy>".to_string(),
                 key_count: 3,
                 config: Some(Config {
                     hkeys: vec![HKey::default(), HKey::default(), HKey::default()],
                     dkeys: Vec::new(),
                 }),
-                config_modified: false,
                 is_dummy: true,
             },
         );
     }
-
-    // pub fn available() -> Vec<Device> {}
 }
 
 pub struct DevicesIterator<'a> {
@@ -335,9 +408,7 @@ impl<'a> Iterator for DevicesIterator<'a> {
     }
 }
 
-pub type DeviceInfo = HashMap<String, String>;
-
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum Error {
     #[error(transparent)]
     Serial(#[from] serialport::Error),
@@ -345,12 +416,9 @@ pub enum Error {
     #[error("error parsing minipad info")]
     Parse(#[from] std::string::FromUtf8Error),
 
+    #[error("serial port io")]
+    Io(#[from] std::io::Error),
+
     #[error("could not read from the serial port")]
     Read,
-
-    #[error("device disconnected")]
-    Disconnect,
-
-    #[error("cannot operate on a dummy device")]
-    Dummy,
 }

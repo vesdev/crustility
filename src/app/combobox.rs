@@ -25,7 +25,6 @@ pub type IconPainter = Box<dyn FnOnce(&Ui, Rect, &WidgetVisuals, bool, AboveOrBe
 /// );
 /// # });
 /// ```
-#[allow(unused)]
 #[must_use = "You should call .show*"]
 pub struct ComboBox {
     id_source: Id,
@@ -36,6 +35,7 @@ pub struct ComboBox {
     wrap_enabled: bool,
 }
 
+#[allow(unused)]
 impl ComboBox {
     /// Create new [`ComboBox`] with id and label
     pub fn new(id_source: impl std::hash::Hash, label: impl Into<WidgetText>) -> Self {

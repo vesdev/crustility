@@ -4,6 +4,7 @@ use crate::device::{self, DeviceHandle, Devices};
 
 mod combobox;
 mod layout;
+mod theme;
 
 pub fn run() -> Result<(), eframe::Error> {
     env_logger::init();
@@ -13,7 +14,7 @@ pub fn run() -> Result<(), eframe::Error> {
     };
 
     let mut devices = Devices::default();
-    devices.refresh();
+    devices.rescan();
 
     eframe::run_native(
         "Crustility",
@@ -24,37 +25,38 @@ pub fn run() -> Result<(), eframe::Error> {
 
 struct Crustility {
     device: Option<DeviceHandle>,
-    time: std::time::Instant,
     error: Option<device::Error>,
     selected_key: Option<usize>,
     devices: Devices,
+    theme: egui::Visuals,
 }
 
 impl Crustility {
     fn new(devices: Devices) -> Self {
         Self {
-            time: std::time::Instant::now(),
             device: None,
             error: None,
             selected_key: None,
             devices,
+            theme: theme::horizon_dark(),
         }
     }
 
     /// gracefully consume error and log it
     /// you can use crustility.error to display it on the gui
     fn consume_error<T>(&mut self, result: Result<T, device::Error>) {
-        if let Err(e) = &result {
-            self.error = Some(e.clone());
+        if let Err(e) = result {
             log::error!("{e}");
+            self.error = Some(e);
         }
     }
 }
 
 impl eframe::App for Crustility {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_pixels_per_point(1.5);
+        ctx.set_visuals(self.theme.clone());
         egui::CentralPanel::default().show(ctx, |ui| {
-            ctx.set_pixels_per_point(1.5);
             if self.device.is_some() {
                 self.menu_bar(ctx, ui);
                 self.device_panel(ctx, ui);
