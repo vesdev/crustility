@@ -1,6 +1,7 @@
 use indexmap::IndexMap;
-use std::io::Read;
+use std::sync::Mutex;
 use std::time::Duration;
+use std::{io::Read, sync::Arc};
 use thiserror::Error;
 
 use crate::config::{self, Config, HKey, Millimeter};
@@ -100,11 +101,12 @@ impl Port {
 /// Device using the minipad serial protocol
 #[derive(Debug)]
 pub struct Device {
-    port: Port,
+    port: Arc<Mutex<Port>>,
     name: String,
     key_count: u16,
     config: Option<Config>,
     is_dummy: bool,
+    pub receiver: Option<std::sync::mpsc::Receiver<SensorValue>>,
 }
 
 impl Device {
@@ -116,11 +118,11 @@ impl Device {
         self.key_count
     }
     #[allow(unused)]
-    pub fn port_name(&self) -> &String {
-        &self.port.port_name
+    pub fn port_name(&self) -> Result<String, Error> {
+        Ok(self.port.lock().map_err(|_| Error::Read)?.port_name.clone())
     }
-    pub fn config_mut(&mut self) -> &mut Option<Config> {
-        &mut self.config
+    pub fn config_mut(&mut self) -> Option<&mut Config> {
+        self.config.as_mut()
     }
 
     pub fn write_config(&mut self) -> Result<(), Error> {
@@ -129,7 +131,8 @@ impl Device {
         }
 
         if let Some(config) = &self.config {
-            self.port.open(serialport::Parity::Even)?;
+            let mut port = self.port.lock().map_err(|_| Error::Read)?;
+            port.open(serialport::Parity::Even)?;
 
             let mut commands = String::new();
 
@@ -156,7 +159,7 @@ impl Device {
             }
 
             log::debug!("{}", commands);
-            self.port.write(commands)?;
+            port.write(commands)?;
         }
         Ok(())
     }
@@ -173,12 +176,14 @@ impl Device {
         // prefix -> (("h" | "d") "key" number) | string
         // suffix & value -> string
 
-        self.port.open(serialport::Parity::Even)?;
-        self.port.write("get\n")?;
+        let mut port = self.port.lock().map_err(|_| Error::Read)?;
+
+        port.open(serialport::Parity::Even)?;
+        port.write("get\n")?;
 
         let mut config = Config::default();
 
-        for line in self.port.read()?.lines() {
+        for line in port.read()?.lines() {
             if line == "GET END" {
                 self.config = Some(config);
                 return Ok(());
@@ -213,52 +218,69 @@ impl Device {
         Ok(())
     }
 
-    pub fn read_sensors(&mut self) -> Result<Vec<Option<SensorValue>>, Error> {
+    pub fn read_sensors(&mut self) -> Result<(), Error> {
+        if self.receiver.is_some() {
+            return Ok(());
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel::<SensorValue>();
+
+        self.receiver = Some(receiver);
+
         if self.is_dummy {
-            if let Some(config) = &mut self.config {
-                let mut result = vec![None; config.hkeys.len()];
+            if let Some(config) = self.config.as_ref() {
                 for (i, _) in config.hkeys.iter().enumerate() {
-                    result[i] = Some(SensorValue {
-                        raw: 500 * i,
-                        mapped: Millimeter::from(2. * i as f32),
-                        key: i,
-                    });
+                    sender
+                        .send(SensorValue {
+                            raw: 500 * i,
+                            mapped: Millimeter::from(2. * i as f32),
+                            key: i,
+                        })
+                        .map_err(|_| Error::Send)?;
                 }
-                return Ok(result);
+                return Ok(());
             }
         }
 
-        self.port.open(serialport::Parity::None)?;
-        if let Some(config) = &mut self.config {
-            self.port.write("out\n")?;
-            let mut result = vec![None; config.hkeys.len()];
-            for line in self.port.read()?.lines() {
-                // log::debug!("{:?}", line);
-                let Some(line) = line.strip_prefix("OUT ") else {
-                    return Err(Error::Read);
-                };
-                let Some((key, value)) = line.split_once('=') else {
-                    return Err(Error::Read);
-                };
-                let Some((raw, mapped)) = value.split_once(' ') else {
-                    return Err(Error::Read);
-                };
+        {
+            let port = self.port.clone();
+            std::thread::spawn(move || {
+                let mut port = port.lock().map_err(|_| Error::Read)?;
 
-                let key_index = key[4..].parse::<usize>();
-                let raw = raw.parse::<usize>();
-                let mapped = mapped.parse::<usize>();
-                if let (Ok(key_index), Ok(raw), Ok(mapped)) = (key_index, raw, mapped) {
-                    result[key_index - 1] = Some(SensorValue {
-                        raw,
-                        mapped: Millimeter::from_serial(mapped),
-                        key: key_index - 1,
-                    });
+                port.open(serialport::Parity::None)?;
+
+                //     let config = self.config.as_mut().ok_or(Error::Read)?;
+
+                port.write("out\n")?;
+                for line in port.read()?.lines() {
+                    log::debug!("{:?}", line);
+                    let Some(line) = line.strip_prefix("OUT ") else {
+                        return Err(Error::Read);
+                    };
+                    let Some((key, value)) = line.split_once('=') else {
+                        return Err(Error::Read);
+                    };
+                    let Some((raw, mapped)) = value.split_once(' ') else {
+                        return Err(Error::Read);
+                    };
+
+                    let key_index = key[4..].parse::<usize>();
+                    let raw = raw.parse::<usize>();
+                    let mapped = mapped.parse::<usize>();
+                    if let (Ok(key_index), Ok(raw), Ok(mapped)) = (key_index, raw, mapped) {
+                        sender
+                            .send(SensorValue {
+                                raw,
+                                mapped: Millimeter::from_serial(mapped),
+                                key: key_index - 1,
+                            })
+                            .map_err(|_| Error::Send)?;
+                    }
                 }
-            }
-            Ok(result)
-        } else {
-            Err(Error::Read)
+                Ok::<(), Error>(())
+            });
         }
+        Ok(())
     }
 }
 
@@ -359,17 +381,18 @@ impl Devices {
                     };
 
                     if let Some(mut device) = old_devices.remove(&handle) {
-                        device.port = Port::new(p.port_name.clone());
+                        device.port = Arc::new(Mutex::new(Port::new(p.port_name.clone())));
                         Some((handle, device))
                     } else {
                         Some((
                             handle,
                             Device {
-                                port: Port::new(p.port_name.clone()),
+                                port: Arc::new(Mutex::new(Port::new(p.port_name.clone()))),
                                 name: info.product.as_ref().map_or("", String::as_str).to_string(),
                                 config: None,
                                 key_count: 0,
                                 is_dummy: false,
+                                receiver: None,
                             },
                         ))
                     }
@@ -383,7 +406,7 @@ impl Devices {
         self.device_map.insert(
             DeviceHandle { pid: 0, vid: 0 },
             Device {
-                port: Port::new("/dev/null".to_string()),
+                port: Arc::new(Mutex::new(Port::new("/dev/null".to_string()))),
                 name: "<dummy>".to_string(),
                 key_count: 3,
                 config: Some(Config {
@@ -391,6 +414,7 @@ impl Devices {
                     dkeys: Vec::new(),
                 }),
                 is_dummy: true,
+                receiver: None,
             },
         );
     }
@@ -421,4 +445,7 @@ pub enum Error {
 
     #[error("could not read from the serial port")]
     Read,
+
+    #[error("could not send the value")]
+    Send,
 }
