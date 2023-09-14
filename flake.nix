@@ -12,7 +12,7 @@
     };
   };
 
-  outputs = inputs@{ self, flake-parts, rust-overlay, crane, nixpkgs, ... }: 
+  outputs = inputs@{ self, flake-parts, rust-overlay, crane, nixpkgs, ... }:
     flake-parts.lib.mkFlake {inherit inputs;} {
         systems = [
           "x86_64-linux"
@@ -33,13 +33,13 @@
               pkg-config
               openssl
             ];
-                       
-            buildInputs = with pkgs; [    
+
+            buildInputs = with pkgs; [
               udev
               libxkbcommon
               vulkan-loader
 
-              wayland             
+              wayland
               libGL
 
               xorg.libXcursor
@@ -75,9 +75,7 @@
 
           devShells.default = pkgs.mkShell
             {
-              
-              buildInputs = commonArgs.buildInputs;
-              nativeBuildInputs = with pkgs; [
+              packages = with pkgs; [
                 (rust-bin.stable.latest.default.override { extensions = [
                   "cargo"
                   "clippy"
@@ -86,8 +84,10 @@
                   "rustc"
                   "rustfmt"
                 ];})
-              ] ++ commonArgs.nativeBuildInputs;
-
+              ];
+              
+              buildInputs = commonArgs.buildInputs;
+              nativeBuildInputs = commonArgs.nativeBuildInputs;
               LD_LIBRARY_PATH=pkgs.lib.makeLibraryPath (commonArgs.buildInputs);
             };
         };

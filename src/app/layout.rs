@@ -231,20 +231,18 @@ impl Crustility {
         let Some(device) = self.devices.get_mut(&device) else {
             return;
         };
-        let sensor_values = device.read_sensors();
-        let Some(config) = &mut device.config_mut() else {
-            return;
-        };
+        let _ = device.read_sensors();
+        let receiver = device.receiver.as_ref();
+
+        if let Some(receiver) = receiver {
+            if let Ok(value) = receiver.try_recv() {
+                device.config_mut().unwrap().hkeys[value.key].current_position = value.mapped;
+            };
+        }
 
         ctx.request_repaint_after(Duration::from_millis(30));
 
-        let mut draw_visualizer = |ui: &mut egui::Ui, (i, key): (usize, &mut HKey)| {
-            if let Ok(values) = &sensor_values {
-                if let Some(value) = &values[i] {
-                    key.current_position = value.mapped;
-                }
-            };
-
+        let mut draw_visualizer = |ui: &mut egui::Ui, (i, key): (usize, &HKey)| {
             // key.current_position = key.current_position
             //     + (key.target_position - key.current_position) / Millimeter::from(2.);
 
@@ -320,9 +318,11 @@ impl Crustility {
         };
 
         ui.horizontal(|ui| {
-            config
+            device
+                .config_mut()
+                .unwrap()
                 .hkeys
-                .iter_mut()
+                .iter()
                 .enumerate()
                 .for_each(|key| draw_visualizer(ui, key));
         });
