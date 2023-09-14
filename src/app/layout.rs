@@ -5,7 +5,10 @@ use std::{
 
 use egui::{pos2, vec2, Color32, RichText};
 
-use crate::{app::combobox, config::HKey};
+use crate::{
+    app::combobox,
+    config::{HKey, Millimeter},
+};
 
 use super::Crustility;
 
@@ -236,15 +239,16 @@ impl Crustility {
 
         if let Some(receiver) = receiver {
             if let Ok(value) = receiver.try_recv() {
-                device.config_mut().unwrap().hkeys[value.key].current_position = value.mapped;
+                device.config_mut().unwrap().hkeys[value.key].target_position = value.mapped;
             };
         }
 
-        ctx.request_repaint_after(Duration::from_millis(30));
+        // 60 fps target
+        ctx.request_repaint_after(Duration::from_millis(10));
 
-        let mut draw_visualizer = |ui: &mut egui::Ui, (i, key): (usize, &HKey)| {
-            // key.current_position = key.current_position
-            //     + (key.target_position - key.current_position) / Millimeter::from(2.);
+        let mut draw_visualizer = |ui: &mut egui::Ui, (i, key): (usize, &mut HKey)| {
+            key.current_position = key.current_position
+                + (key.target_position - key.current_position) / Millimeter::from(5.);
 
             let key_rect = egui::Rect::from_two_pos(
                 egui::pos2(
@@ -322,7 +326,7 @@ impl Crustility {
                 .config_mut()
                 .unwrap()
                 .hkeys
-                .iter()
+                .iter_mut()
                 .enumerate()
                 .for_each(|key| draw_visualizer(ui, key));
         });

@@ -69,8 +69,6 @@ impl Port {
         }
 
         Ok(())
-        // port is guaranteed to be some
-        // Ok(callback(unsafe { self.port.as_mut().unwrap_unchecked() }))
     }
 
     fn write(&mut self, data: impl Into<String>) -> Result<(), Error> {
@@ -244,37 +242,39 @@ impl Device {
 
         {
             let port = self.port.clone();
+
+            #[allow(unreachable_code)]
             std::thread::spawn(move || {
                 let mut port = port.lock().map_err(|_| Error::Read)?;
 
                 port.open(serialport::Parity::None)?;
 
-                //     let config = self.config.as_mut().ok_or(Error::Read)?;
+                loop {
+                    port.write("out\n")?;
+                    for line in port.read()?.lines() {
+                        log::debug!("{:?}", line);
+                        let Some(line) = line.strip_prefix("OUT ") else {
+                            continue;
+                        };
+                        let Some((key, value)) = line.split_once('=') else {
+                            continue;
+                        };
+                        let Some((raw, mapped)) = value.split_once(' ') else {
+                            continue;
+                        };
 
-                port.write("out\n")?;
-                for line in port.read()?.lines() {
-                    log::debug!("{:?}", line);
-                    let Some(line) = line.strip_prefix("OUT ") else {
-                        return Err(Error::Read);
-                    };
-                    let Some((key, value)) = line.split_once('=') else {
-                        return Err(Error::Read);
-                    };
-                    let Some((raw, mapped)) = value.split_once(' ') else {
-                        return Err(Error::Read);
-                    };
-
-                    let key_index = key[4..].parse::<usize>();
-                    let raw = raw.parse::<usize>();
-                    let mapped = mapped.parse::<usize>();
-                    if let (Ok(key_index), Ok(raw), Ok(mapped)) = (key_index, raw, mapped) {
-                        sender
-                            .send(SensorValue {
-                                raw,
-                                mapped: Millimeter::from_serial(mapped),
-                                key: key_index - 1,
-                            })
-                            .map_err(|_| Error::Send)?;
+                        let key_index = key[4..].parse::<usize>();
+                        let raw = raw.parse::<usize>();
+                        let mapped = mapped.parse::<usize>();
+                        if let (Ok(key_index), Ok(raw), Ok(mapped)) = (key_index, raw, mapped) {
+                            sender
+                                .send(SensorValue {
+                                    raw,
+                                    mapped: Millimeter::from_serial(mapped),
+                                    key: key_index - 1,
+                                })
+                                .map_err(|_| Error::Send)?;
+                        }
                     }
                 }
                 Ok::<(), Error>(())
