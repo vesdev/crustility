@@ -21,8 +21,6 @@ macro_rules! write_serial {
 struct Port {
     port: Option<Box<dyn serialport::SerialPort>>,
     port_name: String,
-    unix_permission_requested: bool,
-    buffer: Vec<u8>,
 }
 
 impl Port {
@@ -30,8 +28,6 @@ impl Port {
         Self {
             port: None,
             port_name,
-            unix_permission_requested: false,
-            buffer: Vec::new(),
         }
     }
     /// Operate on a serial port
@@ -47,21 +43,12 @@ impl Port {
                 .stop_bits(serialport::StopBits::One)
                 .open();
 
-            match port {
-                Err(serialport::Error {
-                    kind: serialport::ErrorKind::Io(e),
-                    description: _,
-                }) if e == std::io::ErrorKind::PermissionDenied && cfg!(unix) => {
-                    if self.unix_permission_requested {
-                        let _ = std::process::Command::new("pkexec")
-                            .arg("chmod")
-                            .arg("666")
-                            .arg(self.port_name.as_str())
-                            .spawn();
-                        self.unix_permission_requested = true;
-                    }
-                }
-                _ => (),
+            if port.is_err() && cfg!(unix) {
+                let _ = std::process::Command::new("pkexec")
+                    .arg("chmod")
+                    .arg("666")
+                    .arg(self.port_name.as_str())
+                    .spawn();
             }
 
             self.port = Some(port?);

@@ -8,7 +8,9 @@ egui = { git = "https://github.com/emilk/egui" }
 eframe = { git = "https://github.com/emilk/egui" }
 env_logger = "0.10"
 indexmap = "2.0.0"
-serialport = "4.2.2"
+
+#SEE: https://github.com/serialport/serialport-rs/pull/94
+serialport = { git = "https://github.com/LukaOber/serialport-rs" }
 thiserror = "1.0.48"
 serde = { version = "1.0.164", features = ["derive"], default-features = false }
 log = "0.4.20"
