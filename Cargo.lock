@@ -635,7 +635,6 @@ dependencies = [
  "env_logger",
  "indexmap",
  "log",
- "serde",
  "serialport",
  "thiserror",
 ]
