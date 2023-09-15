@@ -7,7 +7,7 @@ mod theme;
 pub fn run() -> Result<(), eframe::Error> {
     env_logger::init();
     let options = eframe::NativeOptions {
-        initial_window_size: Some(egui::vec2(320.0, 240.0)),
+        initial_window_size: Some(egui::vec2(720.0, 480.0)),
         ..Default::default()
     };
 
